@@ -208,14 +208,60 @@ void windows_window_unhide(struct table* windows, uint32_t wid) {
 }
 
 bool windows_window_destroy(struct table* windows, uint32_t wid, uint32_t sid) {
+  // Always tear down. Matching on sid left orphan overlays whenever
+  // EVENT_WINDOW_DESTROY arrived from a different space than the border
+  // recorded (AeroSpace moves, Mission Control, sticky windows).
+  (void)sid;
   struct border* border = table_find(windows, &wid);
-  if (border && (border->sid == sid || border->sticky || sid == 0)) {
-    table_remove(windows, &wid);
-    border_destroy(border);
-    windows_update_notifications(windows);
-    return true;
+  if (!border) return false;
+  table_remove(windows, &wid);
+  border_destroy(border);
+  windows_update_notifications(windows);
+  return true;
+}
+
+void windows_collect_orphans(struct table* windows) {
+  int cid = SLSMainConnectionID();
+  uint32_t doomed[256];
+  int n = 0;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct bucket* next = bucket->next;
+      if (bucket->value) {
+        uint32_t wid = *(uint32_t*)bucket->key;
+        int owner = 0;
+        CGError err = SLSGetWindowOwner(cid, wid, &owner);
+        if (err != kCGErrorSuccess || owner == 0) {
+          if (n < 256) doomed[n++] = wid;
+        }
+      }
+      bucket = next;
+    }
   }
-  return false;
+  for (int i = 0; i < n; ++i) {
+    debug("Orphan border target gone: %d\n", doomed[i]);
+    windows_window_destroy(windows, doomed[i], 0);
+  }
+}
+
+void windows_destroy_all(struct table* windows) {
+  uint32_t doomed[1024];
+  int n = 0;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct bucket* next = bucket->next;
+      if (bucket->value) {
+        uint32_t wid = *(uint32_t*)bucket->key;
+        if (n < 1024) doomed[n++] = wid;
+      }
+      bucket = next;
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    windows_window_destroy(windows, doomed[i], 0);
+  }
 }
 
 void windows_update_notifications(struct table* windows) {
