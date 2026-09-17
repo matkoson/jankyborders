@@ -218,7 +218,7 @@ void border_update_internal(struct border* border, struct settings* settings) {
     border->frame = frame;
   }
 
-  if (border->needs_redraw) border_draw(border, frame, settings);
+  if (border->needs_redraw && border->context) border_draw(border, frame, settings);
 
   CFTypeRef transaction = SLSTransactionCreate(cid);
   if(!transaction) return;
@@ -243,6 +243,14 @@ void border_update_internal(struct border* border, struct settings* settings) {
   SLSTransactionCommit(transaction, 0);
   CFRelease(transaction);
 
+  if (disabled_update) {
+    if (border->context) CGContextRelease(border->context);
+    border->context = SLWindowContextCreate(cid, border->wid, NULL);
+    if (border->context) {
+      CGContextSetInterpolationQuality(border->context, kCGInterpolationNone);
+    }
+  }
+
   uint64_t set_tags = (1ULL << 1) | (1ULL << 9);
   uint64_t clear_tags = 0;
 
@@ -264,7 +272,9 @@ static void* border_update_async_proc(void* context) {
   }* payload = context;
 
   pthread_mutex_lock(&payload->border->mutex);
-  border_update_internal(payload->border, &payload->settings);
+  if (!payload->border->is_destroyed) {
+    border_update_internal(payload->border, &payload->settings);
+  }
   pthread_mutex_unlock(&payload->border->mutex);
   free(payload);
   return NULL;
@@ -276,6 +286,7 @@ void border_init(struct border* border, int cid) {
   pthread_mutexattr_init(&mattr);
   pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
   pthread_mutex_init(&border->mutex, &mattr);
+  pthread_mutexattr_destroy(&mattr);
   animation_init(&border->animation);
   if (cid) border->cid = cid;
   else border->cid = SLSMainConnectionID();
@@ -290,6 +301,7 @@ struct border* border_create() {
 }
 
 void border_destroy(struct border* border) {
+  border->is_destroyed = true;
   border_hide(border);
   dispatch_async(dispatch_get_main_queue(), ^{
     pthread_mutex_lock(&border->mutex);
@@ -299,13 +311,14 @@ void border_destroy(struct border* border) {
     if (!border->is_proxy && border->cid != SLSMainConnectionID())
       SLSReleaseConnection(border->cid);
     pthread_mutex_unlock(&border->mutex);
+    pthread_mutex_destroy(&border->mutex);
     free(border);
   });
 }
 
 void border_move(struct border* border) {
   pthread_mutex_lock(&border->mutex);
-  if (border->external_proxy_wid) {
+  if (border->is_destroyed || border->external_proxy_wid) {
     pthread_mutex_unlock(&border->mutex);
     return;
   }

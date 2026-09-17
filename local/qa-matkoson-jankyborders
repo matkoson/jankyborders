@@ -1,0 +1,52 @@
+#!/usr/bin/env swift
+import Foundation
+
+let tag = "[qa-matkoson-jankyborders]"
+
+func note(_ message: String) {
+    FileHandle.standardOutput.write(Data("\(tag) \(message)\n".utf8))
+}
+
+func fail(_ message: String, code: Int32 = 1) -> Never {
+    FileHandle.standardError.write(Data("\(tag) \(message)\n".utf8))
+    exit(code)
+}
+
+@discardableResult
+func run(_ executable: String, _ arguments: [String], cwd: String) -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    do { try process.run() } catch { return 127 }
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+func capture(_ executable: String, _ arguments: [String]) -> (Int32, String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do { try process.run() } catch { return (127, "") }
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
+        String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    )
+}
+
+let exe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+let root = exe.deletingLastPathComponent().deletingLastPathComponent().path
+note("root \(root)")
+guard run("/usr/bin/make", ["all"], cwd: root) == 0 else { fail("make failed") }
+let cli = "\(root)/local/matkoson-junkyborders"
+guard FileManager.default.isExecutableFile(atPath: cli) else { fail("cli missing") }
+let (helpStatus, helpText) = capture("/usr/bin/swift", [cli, "help"])
+guard helpStatus == 0, helpText.contains("cleanup") else { fail("cli help failed") }
+let (verStatus, verText) = capture("/usr/bin/swift", [cli, "version"])
+guard verStatus == 0, verText.contains("1.9.1") else { fail("cli version failed") }
+note("PASS")
+exit(0)

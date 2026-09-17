@@ -1,0 +1,187 @@
+#!/usr/bin/env swift
+import CoreGraphics
+import Darwin
+import Foundation
+
+// Fleet CLI: matkoson-junkyborders
+// Engine lives at ~/.local/libexec after install, or in bin/ during checkout.
+
+let tag = "matkoson-junkyborders"
+let version = "1.9.1"
+let label = "com.matkoson.jankyborders"
+
+func note(_ message: String) {
+    FileHandle.standardOutput.write(Data("\(tag) \(message)\n".utf8))
+}
+
+func fail(_ message: String, code: Int32 = 1) -> Never {
+    FileHandle.standardError.write(Data("\(tag) \(message)\n".utf8))
+    exit(code)
+}
+
+func capture(_ executable: String, _ arguments: [String]) -> (Int32, String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do { try process.run() } catch { return (127, "") }
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
+        String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    )
+}
+
+@discardableResult
+func run(_ executable: String, _ arguments: [String]) -> Int32 {
+    capture(executable, arguments).0
+}
+
+func repoRoot() -> String {
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    let local = exe.deletingLastPathComponent()
+    if local.lastPathComponent == "local" {
+        return local.deletingLastPathComponent().path
+    }
+    return FileManager.default.currentDirectoryPath
+}
+
+func enginePath() -> String {
+    let installed = NSHomeDirectory() + "/.local/libexec/matkoson-junkyborders/borders"
+    if FileManager.default.isExecutableFile(atPath: installed) { return installed }
+    let checkout = repoRoot() + "/bin/borders"
+    if FileManager.default.isExecutableFile(atPath: checkout) { return checkout }
+    fail("engine missing; run local/install-matkoson-jankyborders")
+}
+
+func agentPlist() -> String {
+    NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
+}
+
+func helpText() -> String {
+    """
+    \(tag) \(version)
+
+    Commands:
+      help                 this text
+      version              print version
+      status               LaunchAgent + engine process + on-screen overlays
+      start                start or refresh the LaunchAgent
+      stop                 drain overlays, stop the LaunchAgent, kill leftovers
+      cleanup              drain leftover overlays, then restart
+      overlays             count on-screen windows owned by the engine
+      engine               print the signed engine path
+
+    Style flags are forwarded to the engine, same as FelixKratz/JankyBorders.
+    """
+}
+
+func overlayCount() -> Int {
+    guard let info = CGWindowListCopyWindowInfo(
+        [CGWindowListOption.optionOnScreenOnly],
+        kCGNullWindowID
+    ) as? [[String: Any]] else { return -1 }
+    return info.filter { ($0[kCGWindowOwnerName as String] as? String) == "borders" }.count
+}
+
+func printHelp() {
+    FileHandle.standardOutput.write(Data(helpText().utf8))
+}
+
+func status() {
+    let (lcStatus, lcText) = capture("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"])
+    let running = lcStatus == 0 && lcText.contains("state = running")
+    let (pg, pgText) = capture("/usr/bin/pgrep", ["-lf", "matkoson-junkyborders/borders"])
+    note("launch-agent \(running ? "running" : "stopped")")
+    note("engine \(enginePath())")
+    if pg == 0 {
+        note("process\n\(pgText.trimmingCharacters(in: .whitespacesAndNewlines))")
+    } else {
+        note("process none")
+    }
+    note("overlays \(overlayCount())")
+}
+
+func drainEngine() {
+    let (pg, pgText) = capture("/usr/bin/pgrep", ["-f", "matkoson-junkyborders/borders"])
+    if pg == 0 {
+        for line in pgText.split(separator: "\n") {
+            let pid = Int32(line.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            if pid > 1 { kill(pid, SIGTERM) }
+        }
+        for _ in 0..<20 {
+            if capture("/usr/bin/pgrep", ["-f", "matkoson-junkyborders/borders"]).0 != 0 { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+    _ = run("/usr/bin/pkill", ["-x", "borders"])
+}
+
+func stop() {
+    _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+    drainEngine()
+    note("stopped overlays \(overlayCount())")
+}
+
+func startFromPlist() -> Bool {
+    let plist = agentPlist()
+    guard FileManager.default.isReadableFile(atPath: plist),
+          FileManager.default.isExecutableFile(atPath: enginePath()) else { return false }
+    _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+    guard run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plist]) == 0 else { return false }
+    _ = run("/bin/launchctl", ["enable", "gui/\(getuid())/\(label)"])
+    _ = run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+    return true
+}
+
+func start() {
+    if startFromPlist() {
+        note("started")
+        return
+    }
+    let installer = repoRoot() + "/local/install-matkoson-jankyborders"
+    guard FileManager.default.isExecutableFile(atPath: installer) else {
+        fail("installer missing: \(installer)")
+    }
+    let statusCode = run("/usr/bin/swift", [installer])
+    guard statusCode == 0 else { fail("install failed") }
+}
+
+func cleanup() {
+    note("draining leftover overlays")
+    stop()
+    Thread.sleep(forTimeInterval: 0.25)
+    start()
+    for _ in 0..<20 {
+        if overlayCount() >= 0 { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    status()
+}
+
+let args = Array(CommandLine.arguments.dropFirst())
+let command = args.first ?? "help"
+switch command {
+case "help", "-h", "--help":
+    printHelp()
+case "version", "-v", "--version":
+    note(version)
+case "status":
+    status()
+case "start":
+    start()
+case "stop":
+    stop()
+case "cleanup":
+    cleanup()
+case "overlays":
+    FileHandle.standardOutput.write(Data("\(overlayCount())\n".utf8))
+case "engine":
+    FileHandle.standardOutput.write(Data((enginePath() + "\n").utf8))
+default:
+    printHelp()
+    fail("unknown command \(command)", code: 64)
+}
+exit(0)

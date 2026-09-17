@@ -1,0 +1,170 @@
+#!/usr/bin/env swift
+import Darwin
+import Foundation
+
+// Build (if checkout present), Developer ID sign, install LaunchAgent.
+
+let tag = "[install-matkoson-jankyborders]"
+let label = "com.matkoson.jankyborders"
+let identity = "Developer ID Application: Mateusz Koson (73YQ858MMF)"
+let team = "73YQ858MMF"
+let supportName = "MatkosonJankyBorders"
+let style = [
+    "style=round",
+    "width=5.0",
+    "hidpi=on",
+    "ax_focus=on",
+    "active_color=0xffe1e3e4",
+    "inactive_color=0xff494d64",
+]
+
+func note(_ message: String) {
+    FileHandle.standardOutput.write(Data("\(tag) \(message)\n".utf8))
+}
+
+func fail(_ message: String, code: Int32 = 1) -> Never {
+    FileHandle.standardError.write(Data("\(tag) \(message)\n".utf8))
+    exit(code)
+}
+
+@discardableResult
+func run(_ executable: String, _ arguments: [String], cwd: String? = nil) -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+    do { try process.run() } catch { return 127 }
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+func repoRoot() -> String {
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    let local = exe.deletingLastPathComponent()
+    if local.lastPathComponent == "local" {
+        return local.deletingLastPathComponent().path
+    }
+    return FileManager.default.currentDirectoryPath
+}
+
+let root = repoRoot()
+let checkoutEngine = "\(root)/bin/borders"
+if !FileManager.default.isExecutableFile(atPath: checkoutEngine) {
+    note("building engine")
+    guard run("/usr/bin/make", ["all"], cwd: root) == 0 else { fail("make failed") }
+}
+
+let engineSource = checkoutEngine
+guard FileManager.default.isExecutableFile(atPath: engineSource) else {
+    fail("engine missing at \(engineSource)")
+}
+
+let libexec = NSHomeDirectory() + "/.local/libexec/matkoson-junkyborders"
+let engineDest = "\(libexec)/borders"
+do {
+    try FileManager.default.createDirectory(atPath: libexec, withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: engineDest) {
+        try FileManager.default.removeItem(atPath: engineDest)
+    }
+    try FileManager.default.copyItem(atPath: engineSource, toPath: engineDest)
+} catch { fail("copy engine: \(error)") }
+
+// No --timestamp (Apple TSA hangs) and no hardened runtime (SkyLight private APIs).
+let signStatus = run("/usr/bin/codesign", [
+    "--force", "--sign", identity, engineDest,
+])
+if signStatus != 0 {
+    fail("Developer ID sign failed for \(engineDest)")
+}
+note("signed \(engineDest) with \(identity)")
+
+let binDir = NSHomeDirectory() + "/.local/bin"
+let cliSource = "\(root)/local/matkoson-junkyborders"
+let cliDest = "\(binDir)/matkoson-junkyborders"
+do {
+    try FileManager.default.createDirectory(atPath: binDir, withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: cliDest) {
+        try FileManager.default.removeItem(atPath: cliDest)
+    }
+    try FileManager.default.copyItem(atPath: cliSource, toPath: cliDest)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest)
+} catch { fail("install cli: \(error)") }
+
+let home = NSHomeDirectory()
+let support = "\(home)/Library/Application Support/\(supportName)"
+let app = "\(support)/\(supportName).app"
+let macOS = "\(app)/Contents/MacOS"
+let wrapper = "\(macOS)/\(supportName)"
+do {
+    try FileManager.default.createDirectory(atPath: macOS, withIntermediateDirectories: true)
+} catch { fail("mkdir app: \(error)") }
+
+let info = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>\(supportName)</string>
+  <key>CFBundleIdentifier</key><string>\(label)</string>
+  <key>CFBundleName</key><string>\(supportName)</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.9.1</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+"""
+let quotedStyle = style.map { "'\($0)'" }.joined(separator: " ")
+let wrapperBody = """
+#!/bin/bash
+exec '\(engineDest)' \(quotedStyle)
+"""
+do {
+    try info.write(toFile: "\(app)/Contents/Info.plist", atomically: true, encoding: .utf8)
+    try wrapperBody.write(toFile: wrapper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper)
+} catch { fail("write app: \(error)") }
+
+let appSign = run("/usr/bin/codesign", [
+    "--force", "--deep", "--sign", identity, app,
+])
+if appSign != 0 {
+    fail("Developer ID sign failed for \(app)")
+}
+
+let agents = "\(home)/Library/LaunchAgents"
+let plistPath = "\(agents)/\(label).plist"
+let launchPlist = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>\(label)</string>
+  <key>ProgramArguments</key>
+  <array><string>\(wrapper)</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>\(home)/Library/Logs/matkoson-jankyborders.out.log</string>
+  <key>StandardErrorPath</key><string>\(home)/Library/Logs/matkoson-jankyborders.err.log</string>
+</dict>
+</plist>
+"""
+do {
+    try FileManager.default.createDirectory(atPath: agents, withIntermediateDirectories: true)
+    try launchPlist.write(toFile: plistPath, atomically: true, encoding: .utf8)
+} catch { fail("write LaunchAgent: \(error)") }
+
+_ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+_ = run("/usr/bin/pkill", ["-x", "borders"])
+guard run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath]) == 0 else {
+    fail("launchctl bootstrap failed")
+}
+_ = run("/bin/launchctl", ["enable", "gui/\(getuid())/\(label)"])
+_ = run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+note("LaunchAgent \(label) running engine \(engineDest)")
+note("cli \(cliDest)")
+note("PASS")
+exit(0)

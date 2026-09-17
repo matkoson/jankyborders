@@ -1,3 +1,7 @@
+# Matkoson JankyBorders
+
+Matkoson fork of FelixKratz/JankyBorders. Install with `local/install-matkoson-jankyborders`. Fleet CLI is `matkoson-junkyborders`. See `AGENTS.md` for the orphan-border cleanup contract.
+
 # JankyBorders
 
 <img align="right" width="50%" src="images/screenshot.png" alt="Screenshot">

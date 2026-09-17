@@ -10,6 +10,8 @@
 #include "misc/yabai.h"
 #include <stdio.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <pthread.h>
 
 #define VERSION_OPT_LONG "--version"
 #define VERSION_OPT_SHRT "-v"
@@ -19,7 +21,7 @@
 
 #define MAJOR 1
 #define MINOR 9
-#define PATCH 0
+#define PATCH 1
 
 // Resolved via dlsym because of availability
 CFArrayRef (* JBSLSWindowIteratorGetCornerRadii)(CFTypeRef) = NULL;
@@ -225,6 +227,40 @@ int main(int argc, char** argv) {
   }
 
   windows_add_existing_windows(&g_windows);
+
+  sigset_t shutdown_signals;
+  sigemptyset(&shutdown_signals);
+  sigaddset(&shutdown_signals, SIGTERM);
+  sigaddset(&shutdown_signals, SIGINT);
+  pthread_sigmask(SIG_BLOCK, &shutdown_signals, NULL);
+  dispatch_source_t sigterm = dispatch_source_create(
+      DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
+  dispatch_source_t sigint = dispatch_source_create(
+      DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, dispatch_get_main_queue());
+  void (^drain_and_stop)(void) = ^{
+    windows_destroy_all(&g_windows);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(),
+                   ^{
+                     CFRunLoopStop(CFRunLoopGetMain());
+                     exit(0);
+                   });
+  };
+  dispatch_source_set_event_handler(sigterm, drain_and_stop);
+  dispatch_source_set_event_handler(sigint, drain_and_stop);
+  dispatch_resume(sigterm);
+  dispatch_resume(sigint);
+
+  dispatch_source_t orphan_timer = dispatch_source_create(
+      DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+  dispatch_source_set_timer(orphan_timer,
+                            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                            5 * NSEC_PER_SEC,
+                            NSEC_PER_SEC);
+  dispatch_source_set_event_handler(orphan_timer, ^{
+    windows_collect_orphans(&g_windows);
+  });
+  dispatch_resume(orphan_timer);
 
   mach_server_begin(&g_mach_server, message_handler);
   if (!update_mask) execute_config_file("borders", "bordersrc");
